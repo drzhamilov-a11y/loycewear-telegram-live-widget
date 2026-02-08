@@ -4,427 +4,535 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// =====================
-// ENV (на Render)
-// =====================
-const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  SUPABASE_ANON_KEY,
+// ===== ENV =====
+const PORT = process.env.PORT || 3000;
 
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHANNEL_USERNAME, // "loycewear" (без @)
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 
-  VK_TMR_ID,       // "3738381"
-  YM_COUNTER_ID    // "82720792"
-} = process.env;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHANNEL_USERNAME =
+  (process.env.TELEGRAM_CHANNEL_USERNAME || "loycewear").replace("@", "").trim();
+
+const VK_TMR_ID = process.env.VK_TMR_ID || ""; // 3738381
+const YM_COUNTER_ID = process.env.YM_COUNTER_ID || ""; // 82720792
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-  process.exit(1);
+  console.warn("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
 
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-function tgPermalink(channelUsername, messageId) {
-  return `https://t.me/${channelUsername}/${messageId}`;
-}
-
-// =====================
-// 1) Telegram webhook
-// =====================
-app.post("/telegram/webhook", async (req, res) => {
-  try {
-    const update = req.body;
-    const msg = update.channel_post || update.edited_channel_post;
-    if (!msg) return res.status(200).send("ok (no channel_post)");
-
-    const channelUsername = (TELEGRAM_CHANNEL_USERNAME || msg.chat?.username || "")
-      .replace("@", "")
-      .trim();
-    if (!channelUsername) return res.status(200).send("ok (no channel)");
-
-    const messageId = msg.message_id;
-    const postedAt = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString();
-    const text = msg.text || msg.caption || "";
-    const permalink = tgPermalink(channelUsername, messageId);
-
-    // анти-дубли: upsert по уникальному (channel_username,message_id)
-    const { error } = await supabaseAdmin
-      .from("telegram_posts")
-      .upsert(
-        {
-          channel_username: channelUsername,
-          message_id: messageId,
-          posted_at: postedAt,
-          text,
-          permalink,
-          raw: msg
-        },
-        { onConflict: "channel_username,message_id" }
-      );
-
-    if (error) console.error("Supabase upsert error:", error);
-
-    return res.status(200).send("ok");
-  } catch (e) {
-    console.error("Webhook error:", e);
-    return res.status(200).send("ok (error logged)");
-  }
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
 });
 
-// =====================
-// 2) API: posts
-// =====================
-app.get("/api/posts", async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
-  const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME || "").replace("@", "").trim();
+// ===== Small in-memory cache for Telegram getFile =====
+const fileCache = new Map(); // fileId -> { url, exp }
+const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+
+function cacheGet(fileId) {
+  const v = fileCache.get(fileId);
+  if (!v) return null;
+  if (Date.now() > v.exp) {
+    fileCache.delete(fileId);
+    return null;
+  }
+  return v.url;
+}
+
+function cacheSet(fileId, url) {
+  fileCache.set(fileId, { url, exp: Date.now() + CACHE_TTL_MS });
+}
+
+async function tgGetFileUrl(fileId) {
+  if (!TELEGRAM_BOT_TOKEN) return null;
+  const cached = cacheGet(fileId);
+  if (cached) return cached;
+
+  const r = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(
+      fileId
+    )}`
+  );
+  const j = await r.json().catch(() => null);
+  if (!j || !j.ok) return null;
+
+  const filePath = j.result?.file_path;
+  if (!filePath) return null;
+
+  const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+  cacheSet(fileId, url);
+  return url;
+}
+
+// raw.photo: [{file_id, ...}, ...]
+function pickBestPhotoFileId(raw) {
+  const arr = raw?.photo;
+  if (Array.isArray(arr) && arr.length) {
+    return arr[arr.length - 1]?.file_id || null;
+  }
+  return null;
+}
+
+// Album key: Bot API media_group_id OR Telethon grouped_id
+function getAlbumKey(row) {
+  const raw = row.raw || {};
+  const mg = raw.media_group_id ?? raw.grouped_id;
+  return mg ? `album:${mg}` : `msg:${row.message_id}`;
+}
+
+function pickBestText(rows) {
+  for (const r of rows) {
+    const t = (r.text || "").trim();
+    if (t) return t;
+  }
+  return "";
+}
+
+function makePermalink(channel, messageId) {
+  return `https://t.me/${channel}/${messageId}`;
+}
+
+// ===== ROUTES =====
+app.get("/", (req, res) => res.type("text").send("OK"));
+
+// Stats (subscribers)
+app.get("/api/stats", async (req, res) => {
+  const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME)
+    .replace("@", "")
+    .trim();
   if (!channelUsername) return res.status(400).json({ error: "No channel" });
 
   const { data, error } = await supabaseAdmin
-    .from("telegram_posts")
-    .select("channel_username,message_id,posted_at,text,permalink")
+    .from("telegram_channel_stats")
+    .select("channel_username,subscribers_count,updated_at")
     .eq("channel_username", channelUsername)
-    .order("posted_at", { ascending: false })
-    .limit(limit);
+    .order("updated_at", { ascending: false })
+    .limit(1);
 
   if (error) return res.status(500).json({ error: error.message });
-  return res.json({ items: data || [] });
+
+  const row = (data || [])[0] || null;
+  res.json({
+    channel_username: channelUsername,
+    subscribers_count: row?.subscribers_count ?? null,
+    updated_at: row?.updated_at ?? null,
+  });
 });
 
-// =====================
-// 3) Telegram API: subscribers count
-// =====================
-async function fetchTelegramMemberCount(channelUsername) {
-  const chatId = `@${channelUsername}`;
-  const url =
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getChatMemberCount?chat_id=${encodeURIComponent(chatId)}`;
+// Posts (group albums + build images[])
+app.get("/api/posts", async (req, res) => {
+  const limitGroups = Math.min(parseInt(req.query.limit || "20", 10), 50);
+  const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME)
+    .replace("@", "")
+    .trim();
+  if (!channelUsername) return res.status(400).json({ error: "No channel" });
 
-  const r = await fetch(url);
-  const j = await r.json();
-  if (!j.ok) throw new Error(j.description || "Telegram API error");
-  return j.result;
-}
+  // 1 album = many rows => fetch more
+  const fetchRows = Math.min(limitGroups * 16, 800);
 
-app.get("/api/stats", async (req, res) => {
-  try {
-    const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME || "").replace("@", "").trim();
-    if (!channelUsername) return res.status(400).json({ error: "No channel" });
+  const { data, error } = await supabaseAdmin
+    .from("telegram_posts")
+    .select("channel_username,message_id,posted_at,text,permalink,raw")
+    .eq("channel_username", channelUsername)
+    .order("posted_at", { ascending: false })
+    .limit(fetchRows);
 
-    let memberCount = null;
+  if (error) return res.status(500).json({ error: error.message });
 
-    if (TELEGRAM_BOT_TOKEN) {
-      try {
-        memberCount = await fetchTelegramMemberCount(channelUsername);
-
-        await supabaseAdmin
-          .from("telegram_channel_stats")
-          .upsert(
-            {
-              channel_username: channelUsername,
-              member_count: memberCount,
-              updated_at: new Date().toISOString()
-            },
-            { onConflict: "channel_username" }
-          );
-      } catch (e) {
-        console.warn("MemberCount fetch failed, fallback to DB:", e.message);
-      }
-    }
-
-    if (memberCount === null) {
-      const { data } = await supabaseAdmin
-        .from("telegram_channel_stats")
-        .select("member_count,updated_at")
-        .eq("channel_username", channelUsername)
-        .maybeSingle();
-
-      memberCount = data?.member_count ?? 0;
-    }
-
-    return res.json({ channel: channelUsername, member_count: memberCount });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
+  // group rows
+  const map = new Map();
+  for (const row of data || []) {
+    const key = getAlbumKey(row);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(row);
   }
+
+  let groups = Array.from(map.values());
+
+  // sort groups by newest posted_at inside
+  groups.sort((a, b) => {
+    const ta = Math.max(...a.map((x) => new Date(x.posted_at).getTime()));
+    const tb = Math.max(...b.map((x) => new Date(x.posted_at).getTime()));
+    return tb - ta;
+  });
+
+  groups = groups.slice(0, limitGroups);
+
+  const items = [];
+  for (const rows of groups) {
+    rows.sort((a, b) => a.message_id - b.message_id);
+
+    const first = rows[0];
+    const minId = first.message_id;
+
+    const fileIds = [];
+    for (const r of rows) {
+      const fid = pickBestPhotoFileId(r.raw || {});
+      if (fid) fileIds.push(fid);
+    }
+
+    const images = [];
+    for (const fid of fileIds) {
+      const u = await tgGetFileUrl(fid);
+      if (u) images.push(u);
+    }
+
+    items.push({
+      channel_username: channelUsername,
+      message_id: minId,
+      posted_at: first.posted_at,
+      text: pickBestText(rows),
+      permalink: makePermalink(channelUsername, minId),
+      images,
+    });
+  }
+
+  res.json({ items });
 });
 
-// =====================
-// 4) Widget page (вставляем в Taplink через iframe)
-// =====================
-app.get("/widget", async (req, res) => {
-  const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME || "loycewear").replace("@", "").trim();
+// Widget UI
+app.get("/widget", (req, res) => {
+  const channel = (req.query.channel || TELEGRAM_CHANNEL_USERNAME).replace("@", "").trim();
+  const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
 
-  const anonKey = SUPABASE_ANON_KEY || "";
-  const vkId = VK_TMR_ID || "3738381";
-  const ymId = YM_COUNTER_ID || "82720792";
+  // If anon key missing, realtime won't work (but list will still load via /api/posts).
+  const anon = SUPABASE_ANON_KEY;
 
   const html = `<!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Telegram-лента @${channelUsername}</title>
-
-  <style>
-    :root{
-      --text:#f5f5f7;
-      --muted:#b8b8c6;
-      --border:rgba(255,255,255,.12);
-      --shadow: 0 12px 30px rgba(0,0,0,.35);
-      --radius:18px;
-    }
-    *{box-sizing:border-box}
-    body{
-      margin:0;
-      background:transparent;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      color:var(--text);
-    }
-    .wrap{width:100%; max-width:860px; margin:0 auto; padding:12px;}
-    .widget{
-      border:1px solid var(--border);
-      border-radius: var(--radius);
-      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
-      box-shadow: var(--shadow);
-      overflow:hidden;
-    }
-    .head{
-      display:flex; align-items:center; justify-content:space-between;
-      padding:14px 14px 12px 14px;
-      background: rgba(0,0,0,.25);
-      border-bottom:1px solid var(--border);
-    }
-    .title{display:flex; flex-direction:column; gap:2px; min-width:0;}
-    .title b{font-size:14.5px; letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
-    .sub{display:flex; gap:10px; align-items:center; font-size:12.5px; color:var(--muted);}
-    .dot{width:8px;height:8px;border-radius:999px;background:#32d74b;box-shadow:0 0 0 4px rgba(50,215,75,.14);display:inline-block;margin-right:6px;}
-    .online{
-      display:inline-flex; align-items:center; gap:6px;
-      padding:6px 10px; border:1px solid rgba(255,255,255,.18);
-      border-radius:999px; background: rgba(0,0,0,.18);
-      font-size:12px; color:var(--text); user-select:none; white-space:nowrap;
-    }
-
-    .scroller{
-      height:520px;
-      overflow:auto;
-      padding:12px;
-      background: rgba(0,0,0,.12);
-    }
-    .hintTop{
-      font-size:12px;
-      color:var(--muted);
-      border:1px dashed rgba(255,255,255,.14);
-      border-radius:14px;
-      padding:10px 12px;
-      margin:0 0 12px 0;
-      background: rgba(0,0,0,.18);
-    }
-
-    .post{
-      border:1px solid rgba(255,255,255,.12);
-      border-radius:16px;
-      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
-      padding:12px 12px 10px 12px;
-      margin:0 0 10px 0;
-    }
-    .meta{display:flex; justify-content:space-between; gap:8px; font-size:12px; color:var(--muted); margin-bottom:8px;}
-    .text{font-size:14px; line-height:1.45; color:var(--text); white-space:pre-wrap; word-break:break-word;}
-    .actions{margin-top:10px; display:flex; justify-content:flex-end;}
-    .btn{
-      display:inline-flex; align-items:center; gap:8px;
-      border:none; cursor:pointer;
-      padding:10px 12px; border-radius:12px;
-      background: rgba(255,255,255,.92);
-      color:#0b0b0f; font-weight:700; font-size:13px;
-      text-decoration:none;
-    }
-    .btn:active{transform: translateY(1px)}
-    .tgicon{width:18px;height:18px}
-    .foot{
-      border-top:1px solid var(--border);
-      padding:10px 14px;
-      background: rgba(0,0,0,.22);
-      color:var(--muted);
-      font-size:12.5px;
-      text-align:center;
-    }
-    @media (max-width: 420px){
-      .scroller{ height:480px; }
-      .btn{ width:100%; justify-content:center; }
-      .actions{ justify-content:stretch; }
-      .sub{flex-wrap:wrap}
-    }
-  </style>
-
-  <!-- VK Ads / Top.Mail.Ru counter (ваш код) -->
-  <script type="text/javascript">
-  var _tmr = window._tmr || (window._tmr = []);
-  _tmr.push({id: "${vkId}", type: "pageView", start: (new Date()).getTime()});
-  (function (d, w, id) {
-    if (d.getElementById(id)) return;
-    var ts = d.createElement("script"); ts.type = "text/javascript"; ts.async = true; ts.id = id;
-    ts.src = "https://top-fwz1.mail.ru/js/code.js";
-    var f = function () {var s = d.getElementsByTagName("script")[0]; s.parentNode.insertBefore(ts, s);};
-    if (w.opera == "[object Opera]") { d.addEventListener("DOMContentLoaded", f, false); } else { f(); }
-  })(document, window, "tmr-code");
-  </script>
-  <noscript><div><img src="https://top-fwz1.mail.ru/counter?id=${vkId};js=na" style="position:absolute;left:-9999px;" alt="Top.Mail.Ru" /></div></noscript>
-
-  <!-- ВАЖНО: Метрика должна быть установлена (в Taplink глобально или сюда полным кодом).
-       Здесь мы используем только вызов цели ym(..., 'reachGoal', 'tg_open') -->
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Telegram-лента @${channel}</title>
+<style>
+  :root{
+    --tg:#229ED9;
+    --tg-dark:#1C8ABF;
+    --bg:#ffffff;
+    --card:#ffffff;
+    --text:#0f172a;
+    --muted:#64748b;
+    --border:#e5e7eb;
+    --shadow: 0 10px 30px rgba(2, 6, 23, .10);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .wrap{ width:100%; margin:0 auto; padding:14px; }
+  .widget{
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    background: var(--bg);
+  }
+  .head{
+    padding: 14px 14px 10px;
+    border-bottom: 1px solid var(--border);
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:10px;
+  }
+  .title{
+    font-weight: 800;
+    font-size: 16px;
+    color: var(--text);
+    line-height: 1.2;
+  }
+  .subline{
+    margin-top:6px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .online{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background:#f8fafc;
+    color:#0f172a;
+    font-size: 12px;
+    font-weight: 700;
+    white-space:nowrap;
+  }
+  .dot{
+    width:10px;height:10px;border-radius:999px;
+    background:#22c55e;
+    box-shadow: 0 0 0 4px rgba(34,197,94,.15);
+  }
+  .hint{
+    margin: 10px 14px 0;
+    padding: 10px 12px;
+    border: 1px dashed rgba(34,158,217,.35);
+    background: rgba(34,158,217,.06);
+    border-radius: 12px;
+    color: #0f172a;
+    font-size: 13px;
+  }
+  .feed{
+    height: 640px;
+    overflow:auto;
+    padding: 12px 12px 54px;
+    background: #f8fafc;
+  }
+  .card{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 12px;
+    margin-bottom: 12px;
+    box-shadow: 0 6px 18px rgba(2, 6, 23, .06);
+  }
+  .meta{
+    display:flex;
+    justify-content:space-between;
+    gap:10px;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .text{
+    font-size: 14px;
+    line-height: 1.45;
+    color: var(--text);
+    white-space: pre-wrap;
+  }
+  .carousel{
+    margin-top: 10px;
+    display:flex;
+    gap:10px;
+    overflow-x:auto;
+    padding-bottom: 6px;
+    scroll-snap-type: x mandatory;
+  }
+  .carousel::-webkit-scrollbar{height:8px}
+  .carousel::-webkit-scrollbar-thumb{background: rgba(15,23,42,.18); border-radius:999px}
+  .shot{
+    flex: 0 0 86%;
+    scroll-snap-align: start;
+    border-radius: 14px;
+    overflow:hidden;
+    border:1px solid var(--border);
+    background:#fff;
+  }
+  .shot img{ width:100%; display:block; }
+  .actions{
+    margin-top: 12px;
+    display:flex;
+    justify-content:flex-end;
+  }
+  .btn{
+    display:inline-flex;
+    align-items:center;
+    gap:10px;
+    padding: 10px 14px;
+    border-radius: 999px;
+    border: 1px solid rgba(34,158,217,.35);
+    background: rgba(34,158,217,.10);
+    color: var(--tg-dark);
+    font-weight: 800;
+    text-decoration:none;
+    transition: .15s ease;
+    user-select:none;
+  }
+  .btn:hover{
+    background: rgba(34,158,217,.16);
+    border-color: rgba(34,158,217,.55);
+  }
+  .plane{ width:18px;height:18px; fill: var(--tg-dark); }
+  .footer{
+    position: relative;
+    margin-top: -44px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    background: linear-gradient(to top, #ffffff 70%, rgba(255,255,255,0));
+    color: var(--muted);
+    font-size: 12px;
+    text-align:center;
+  }
+  @media (max-width:480px){
+    .feed{ height: 560px; }
+    .shot{ flex-basis: 92%; }
+  }
+</style>
 </head>
-
 <body>
-  <div class="wrap">
-    <div class="widget">
-      <div class="head">
-        <div class="title">
-          <b>Telegram-лента канала @${channelUsername}</b>
-          <div class="sub">
-            <span class="online"><span class="dot"></span>Online</span>
-            <span id="subs">Подписчиков: …</span>
-          </div>
+<div class="wrap">
+  <div class="widget">
+    <div class="head">
+      <div>
+        <div class="title">Telegram-лента канала @${channel}</div>
+        <div class="subline">
+          <span class="online"><span class="dot"></span>Online</span>
+          <span id="subs">Подписчиков: …</span>
         </div>
       </div>
-
-      <div class="scroller" id="scroller">
-        <div class="hintTop">Подсказка: внутри этого блока можно прокручивать посты (скролл).</div>
-        <div id="list"></div>
-      </div>
-
-      <div class="foot">Прокрутите внутри блока, чтобы увидеть ещё посты ↓</div>
     </div>
+
+    <div class="hint">Посты можно прокручивать <b>внутри этого блока</b>.</div>
+
+    <div id="feed" class="feed"></div>
+
+    <div class="footer">Прокрутите внутри блока, чтобы увидеть ещё посты ↓</div>
   </div>
+</div>
 
-  <script type="module">
-    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+<!-- VK Top.Mail.Ru counter (из env VK_TMR_ID) -->
+${VK_TMR_ID ? `
+<script type="text/javascript">
+var _tmr = window._tmr || (window._tmr = []);
+_tmr.push({id: "${VK_TMR_ID}", type: "pageView", start: (new Date()).getTime()});
+(function (d, w, id) {
+  if (d.getElementById(id)) return;
+  var ts = d.createElement("script"); ts.type = "text/javascript"; ts.async = true; ts.id = id;
+  ts.src = "https://top-fwz1.mail.ru/js/code.js";
+  var f = function () {var s = d.getElementsByTagName("script")[0]; s.parentNode.insertBefore(ts, s);};
+  if (w.opera == "[object Opera]") { d.addEventListener("DOMContentLoaded", f, false); } else { f(); }
+})(document, window, "tmr-code");
+</script>
+<noscript><div><img src="https://top-fwz1.mail.ru/counter?id=${VK_TMR_ID};js=na" style="position:absolute;left:-9999px;" alt="Top.Mail.Ru" /></div></noscript>
+` : ""}
 
-    const SUPABASE_URL = ${JSON.stringify(SUPABASE_URL)};
-    const SUPABASE_ANON_KEY = ${JSON.stringify(anonKey)};
-    const CHANNEL = ${JSON.stringify(channelUsername)};
-    const YM_ID = ${JSON.stringify(ymId)};
-    const VK_ID = ${JSON.stringify(vkId)};
+<!-- Yandex Metrika loader + goal (из env YM_COUNTER_ID) -->
+${YM_COUNTER_ID ? `
+<script type="text/javascript">
+(function(m,e,t,r,i,k,a){
+  m[i]=m[i]||function(){(m[i].a=m[i].a||[]).push(arguments)};
+  m[i].l=1*new Date();
+  k=e.createElement(t),a=e.getElementsByTagName(t)[0],k.async=1,k.src=r,a.parentNode.insertBefore(k,a)
+})(window, document, "script", "https://mc.yandex.ru/metrika/tag.js", "ym");
+ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBounce:true, webvisor:false });
+</script>
+<noscript><div><img src="https://mc.yandex.ru/watch/${YM_COUNTER_ID}" style="position:absolute; left:-9999px;" alt="" /></div></noscript>
+` : ""}
 
-    const listEl = document.getElementById("list");
-    const subsEl = document.getElementById("subs");
+<script type="module">
+  const CHANNEL = ${JSON.stringify(channel)};
+  const LIMIT = ${JSON.stringify(limit)};
 
-    function formatDate(iso){
-      try{
-        const d = new Date(iso);
-        return d.toLocaleString("ru-RU", { day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
-      }catch(e){ return ""; }
+  const SUPABASE_URL = ${JSON.stringify(SUPABASE_URL)};
+  const SUPABASE_ANON_KEY = ${JSON.stringify(anon)};
+
+  const feed = document.getElementById("feed");
+  const subsEl = document.getElementById("subs");
+
+  function escapeHtml(s){
+    return (s || "").replace(/[&<>"']/g, (m)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m]));
+  }
+
+  function fmtDate(iso){
+    const dt = iso ? new Date(iso) : null;
+    if (!dt) return "";
+    return dt.toLocaleString("ru-RU", { year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
+  }
+
+  window.trackTgOpen = function(){
+    try{
+      if (window._tmr) window._tmr.push({ type: "reachGoal", goal: "tg_open" });
+    }catch(e){}
+    try{
+      if (window.ym) ym(${YM_COUNTER_ID ? YM_COUNTER_ID : "0"}, "reachGoal", "tg_open");
+    }catch(e){}
+  };
+
+  function renderPost(item){
+    const el = document.createElement("div");
+    el.className = "card";
+
+    const text = (item.text || "").trim();
+    const carousel = Array.isArray(item.images) && item.images.length
+      ? \`<div class="carousel">\${item.images.map(u => \`<div class="shot"><img src="\${u}" loading="lazy" /></div>\`).join("")}</div>\`
+      : "";
+
+    el.innerHTML = \`
+      <div class="meta">
+        <div>Пост #\${item.message_id}</div>
+        <div>\${escapeHtml(fmtDate(item.posted_at))}</div>
+      </div>
+      <div class="text">\${text ? escapeHtml(text) : "<i style='color:#64748b'>Подпись отсутствует</i>"}</div>
+      \${carousel}
+      <div class="actions">
+        <a class="btn" href="\${item.permalink}" target="_blank" rel="noopener" onclick="trackTgOpen()">
+          <svg class="plane" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21.9 4.6c.3-1.3-1-2.2-2.1-1.7L2.6 10c-1.4.6-1.3 2.6.1 3.1l4.7 1.6 1.8 5.2c.5 1.4 2.4 1.5 3.1.2l2.7-4.7 4.7 3.4c1.2.9 2.9.2 3.2-1.3L21.9 4.6zM9.4 14.1l8.7-7.1-7 8.5-.3 3-1.5-4.1-3.9-1.3 13.7-5.6-9.7 6.6z"/>
+          </svg>
+          Открыть пост в канале!
+        </a>
+      </div>
+    \`;
+
+    return el;
+  }
+
+  async function loadStats(){
+    const r = await fetch(\`/api/stats?channel=\${encodeURIComponent(CHANNEL)}\`);
+    const j = await r.json().catch(()=>null);
+    if (j && typeof j.subscribers_count === "number") {
+      subsEl.textContent = "Подписчиков: " + j.subscribers_count.toLocaleString("ru-RU");
+    } else {
+      subsEl.textContent = "Подписчиков: —";
     }
+  }
 
-    function safeText(s){
-      return (s || "")
-        .replaceAll("&","&amp;")
-        .replaceAll("<","&lt;")
-        .replaceAll(">","&gt;")
-        .replaceAll('"',"&quot;")
-        .replaceAll("'","&#039;");
+  async function loadPosts(){
+    feed.innerHTML = "";
+    const r = await fetch(\`/api/posts?channel=\${encodeURIComponent(CHANNEL)}&limit=\${LIMIT}\`);
+    const j = await r.json().catch(()=>null);
+    const items = j?.items || [];
+    if (!items.length){
+      const empty = document.createElement("div");
+      empty.className = "card";
+      empty.innerHTML = "<div class='text' style='color:#64748b'>Пока нет данных. Загрузите историю в Supabase или дождитесь новых постов.</div>";
+      feed.appendChild(empty);
+      return;
     }
-
-    function fireTgOpenEvents(){
-      // VK Ads / Top.Mail.Ru goal
-      try{
-        const _tmr = window._tmr || (window._tmr = []);
-        _tmr.push({ id: VK_ID, type: "reachGoal", goal: "tg_open" });
-      }catch(e){}
-
-      // Yandex Metrika goal
-      try{
-        if (typeof window.ym === "function") {
-          window.ym(Number(YM_ID), "reachGoal", "tg_open");
-        }
-      }catch(e){}
+    for (const it of items){
+      feed.appendChild(renderPost(it));
     }
+  }
 
-    function renderPost(item){
-      const text = safeText(item.text || "");
-      const date = formatDate(item.posted_at);
-      const link = item.permalink;
+  // Realtime: если есть anon key
+  async function enableRealtime(){
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
 
-      const el = document.createElement("div");
-      el.className = "post";
-      el.innerHTML = \`
-        <div class="meta">
-          <span>Пост #\${item.message_id}</span>
-          <span>\${date}</span>
-        </div>
-        <div class="text">\${text || "<i style='color:rgba(255,255,255,.7)'>Без текста (возможен медиа-пост)</i>"}</div>
-        <div class="actions">
-          <a class="btn" href="\${link}" target="_blank" rel="noopener noreferrer">
-            <svg class="tgicon" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M21.7 3.2c.4.2.6.7.5 1.2l-3.2 15.3c-.1.5-.5.9-1 .9-.2.1-.5 0-.8-.1l-4.7-3.5-2.3 2.2c-.2.2-.4.3-.7.3-.1 0-.2 0-.3-.1-.3-.1-.5-.4-.5-.8v-3l8.9-8.2c.3-.3.4-.7.1-1-.2-.3-.6-.3-1-.1l-11 6.9-4.6-1.5c-.4-.1-.7-.5-.7-1s.2-.9.7-1.1L20.4 3c.4-.2.9-.2 1.3.2z"></path>
-            </svg>
-            Открыть пост в канале!
-          </a>
-        </div>
-      \`;
+    const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
+    const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-      el.querySelector("a.btn").addEventListener("click", () => {
-        fireTgOpenEvents();
-      });
-
-      return el;
-    }
-
-    async function loadInitial(){
-      const r = await fetch(\`/api/posts?channel=\${encodeURIComponent(CHANNEL)}&limit=20\`);
-      const j = await r.json();
-      listEl.innerHTML = "";
-      (j.items || []).forEach(item => listEl.appendChild(renderPost(item)));
-    }
-
-    async function loadStats(){
-      try{
-        const r = await fetch(\`/api/stats?channel=\${encodeURIComponent(CHANNEL)}\`);
-        const j = await r.json();
-        subsEl.textContent = "Подписчиков: " + (j.member_count ?? "—");
-      }catch(e){
-        subsEl.textContent = "Подписчиков: —";
-      }
-    }
-
-    await loadStats();
-    await loadInitial();
-
-    // ===== Realtime: новые посты сразу =====
-    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-
-    supabase
-      .channel("tg-feed")
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "telegram_posts",
-          filter: \`channel_username=eq.\${CHANNEL}\`
-        },
-        (payload) => {
-          const item = payload.new;
-          const node = renderPost(item);
-          listEl.prepend(node);
-
-          const sc = document.getElementById("scroller");
-          sc.scrollTop = 0;
-        }
-      )
+    sb.channel("tg-posts")
+      .on("postgres_changes", {
+        event: "INSERT",
+        schema: "public",
+        table: "telegram_posts",
+        filter: \`channel_username=eq.\${CHANNEL}\`
+      }, async () => {
+        // При любом новом элементе альбома перерисовываем список
+        await loadPosts();
+        await loadStats();
+      })
       .subscribe();
+  }
 
-    setInterval(loadStats, 60000);
-  </script>
+  await loadStats();
+  await loadPosts();
+  await enableRealtime();
+</script>
 </body>
 </html>`;
 
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  return res.status(200).send(html);
+  res.type("html").send(html);
 });
 
-// health
-app.get("/", (req, res) => res.send("OK"));
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server listening on", port));
+app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
+});
