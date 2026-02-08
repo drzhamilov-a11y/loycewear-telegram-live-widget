@@ -4,7 +4,6 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ===== ENV =====
 const PORT = process.env.PORT || 3000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -18,63 +17,12 @@ const TELEGRAM_CHANNEL_USERNAME =
 const VK_TMR_ID = process.env.VK_TMR_ID || ""; // 3738381
 const YM_COUNTER_ID = process.env.YM_COUNTER_ID || ""; // 82720792
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-}
-
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-// ===== Small in-memory cache for Telegram getFile =====
-const fileCache = new Map(); // fileId -> { url, exp }
-const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+app.get("/", (req, res) => res.type("text").send("OK"));
 
-function cacheGet(fileId) {
-  const v = fileCache.get(fileId);
-  if (!v) return null;
-  if (Date.now() > v.exp) {
-    fileCache.delete(fileId);
-    return null;
-  }
-  return v.url;
-}
-
-function cacheSet(fileId, url) {
-  fileCache.set(fileId, { url, exp: Date.now() + CACHE_TTL_MS });
-}
-
-async function tgGetFileUrl(fileId) {
-  if (!TELEGRAM_BOT_TOKEN) return null;
-  const cached = cacheGet(fileId);
-  if (cached) return cached;
-
-  const r = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(
-      fileId
-    )}`
-  );
-  const j = await r.json().catch(() => null);
-  if (!j || !j.ok) return null;
-
-  const filePath = j.result?.file_path;
-  if (!filePath) return null;
-
-  const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
-  cacheSet(fileId, url);
-  return url;
-}
-
-// raw.photo: [{file_id, ...}, ...]
-function pickBestPhotoFileId(raw) {
-  const arr = raw?.photo;
-  if (Array.isArray(arr) && arr.length) {
-    return arr[arr.length - 1]?.file_id || null;
-  }
-  return null;
-}
-
-// Album key: Bot API media_group_id OR Telethon grouped_id
 function getAlbumKey(row) {
   const raw = row.raw || {};
   const mg = raw.media_group_id ?? raw.grouped_id;
@@ -93,16 +41,29 @@ function makePermalink(channel, messageId) {
   return `https://t.me/${channel}/${messageId}`;
 }
 
-// ===== ROUTES =====
-app.get("/", (req, res) => res.type("text").send("OK"));
+async function tgMemberCount(channelUsername) {
+  if (!TELEGRAM_BOT_TOKEN) return null;
+  try {
+    const r = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getChatMemberCount?chat_id=@${encodeURIComponent(
+        channelUsername
+      )}`
+    );
+    const j = await r.json();
+    if (j.ok && typeof j.result === "number") return j.result;
+    return null;
+  } catch {
+    return null;
+  }
+}
 
-// Stats (subscribers)
+// ===== stats =====
 app.get("/api/stats", async (req, res) => {
   const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME)
     .replace("@", "")
     .trim();
-  if (!channelUsername) return res.status(400).json({ error: "No channel" });
 
+  // 1) пробуем таблицу telegram_channel_stats
   const { data, error } = await supabaseAdmin
     .from("telegram_channel_stats")
     .select("channel_username,subscribers_count,updated_at")
@@ -110,37 +71,46 @@ app.get("/api/stats", async (req, res) => {
     .order("updated_at", { ascending: false })
     .limit(1);
 
-  if (error) return res.status(500).json({ error: error.message });
+  if (!error) {
+    const row = (data || [])[0];
+    if (row?.subscribers_count != null) {
+      return res.json({
+        channel_username: channelUsername,
+        subscribers_count: row.subscribers_count,
+        updated_at: row.updated_at,
+        source: "supabase",
+      });
+    }
+  }
 
-  const row = (data || [])[0] || null;
-  res.json({
+  // 2) fallback: Telegram Bot API
+  const cnt = await tgMemberCount(channelUsername);
+  return res.json({
     channel_username: channelUsername,
-    subscribers_count: row?.subscribers_count ?? null,
-    updated_at: row?.updated_at ?? null,
+    subscribers_count: cnt,
+    updated_at: null,
+    source: "telegram",
   });
 });
 
-// Posts (group albums + build images[])
+// ===== posts (albums + media_urls) =====
 app.get("/api/posts", async (req, res) => {
   const limitGroups = Math.min(parseInt(req.query.limit || "20", 10), 50);
   const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME)
     .replace("@", "")
     .trim();
-  if (!channelUsername) return res.status(400).json({ error: "No channel" });
 
-  // 1 album = many rows => fetch more
-  const fetchRows = Math.min(limitGroups * 16, 800);
+  const fetchRows = Math.min(limitGroups * 20, 1000);
 
   const { data, error } = await supabaseAdmin
     .from("telegram_posts")
-    .select("channel_username,message_id,posted_at,text,permalink,raw")
+    .select("channel_username,message_id,posted_at,text,permalink,raw,media_urls")
     .eq("channel_username", channelUsername)
     .order("posted_at", { ascending: false })
     .limit(fetchRows);
 
   if (error) return res.status(500).json({ error: error.message });
 
-  // group rows
   const map = new Map();
   for (const row of data || []) {
     const key = getAlbumKey(row);
@@ -150,7 +120,6 @@ app.get("/api/posts", async (req, res) => {
 
   let groups = Array.from(map.values());
 
-  // sort groups by newest posted_at inside
   groups.sort((a, b) => {
     const ta = Math.max(...a.map((x) => new Date(x.posted_at).getTime()));
     const tb = Math.max(...b.map((x) => new Date(x.posted_at).getTime()));
@@ -159,45 +128,38 @@ app.get("/api/posts", async (req, res) => {
 
   groups = groups.slice(0, limitGroups);
 
-  const items = [];
-  for (const rows of groups) {
+  const items = groups.map((rows) => {
     rows.sort((a, b) => a.message_id - b.message_id);
 
     const first = rows[0];
     const minId = first.message_id;
 
-    const fileIds = [];
-    for (const r of rows) {
-      const fid = pickBestPhotoFileId(r.raw || {});
-      if (fid) fileIds.push(fid);
-    }
-
+    // собираем все фото из media_urls
     const images = [];
-    for (const fid of fileIds) {
-      const u = await tgGetFileUrl(fid);
-      if (u) images.push(u);
+    for (const r of rows) {
+      const arr = r.media_urls;
+      if (Array.isArray(arr)) {
+        for (const u of arr) if (typeof u === "string" && u) images.push(u);
+      }
     }
 
-    items.push({
+    return {
       channel_username: channelUsername,
       message_id: minId,
       posted_at: first.posted_at,
       text: pickBestText(rows),
       permalink: makePermalink(channelUsername, minId),
       images,
-    });
-  }
+    };
+  });
 
   res.json({ items });
 });
 
-// Widget UI
+// ===== widget =====
 app.get("/widget", (req, res) => {
   const channel = (req.query.channel || TELEGRAM_CHANNEL_USERNAME).replace("@", "").trim();
   const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
-
-  // If anon key missing, realtime won't work (but list will still load via /api/posts).
-  const anon = SUPABASE_ANON_KEY;
 
   const html = `<!doctype html>
 <html lang="ru">
@@ -217,154 +179,32 @@ app.get("/widget", (req, res) => {
     --shadow: 0 10px 30px rgba(2, 6, 23, .10);
   }
   *{box-sizing:border-box}
-  body{
-    margin:0;
-    font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-  }
-  .wrap{ width:100%; margin:0 auto; padding:14px; }
-  .widget{
-    border: 1px solid var(--border);
-    border-radius: 18px;
-    box-shadow: var(--shadow);
-    overflow: hidden;
-    background: var(--bg);
-  }
-  .head{
-    padding: 14px 14px 10px;
-    border-bottom: 1px solid var(--border);
-    display:flex;
-    align-items:flex-start;
-    justify-content:space-between;
-    gap:10px;
-  }
-  .title{
-    font-weight: 800;
-    font-size: 16px;
-    color: var(--text);
-    line-height: 1.2;
-  }
-  .subline{
-    margin-top:6px;
-    display:flex;
-    align-items:center;
-    gap:10px;
-    color: var(--muted);
-    font-size: 13px;
-  }
-  .online{
-    display:inline-flex;
-    align-items:center;
-    gap:8px;
-    padding: 6px 10px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background:#f8fafc;
-    color:#0f172a;
-    font-size: 12px;
-    font-weight: 700;
-    white-space:nowrap;
-  }
-  .dot{
-    width:10px;height:10px;border-radius:999px;
-    background:#22c55e;
-    box-shadow: 0 0 0 4px rgba(34,197,94,.15);
-  }
-  .hint{
-    margin: 10px 14px 0;
-    padding: 10px 12px;
-    border: 1px dashed rgba(34,158,217,.35);
-    background: rgba(34,158,217,.06);
-    border-radius: 12px;
-    color: #0f172a;
-    font-size: 13px;
-  }
-  .feed{
-    height: 640px;
-    overflow:auto;
-    padding: 12px 12px 54px;
-    background: #f8fafc;
-  }
-  .card{
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 12px;
-    margin-bottom: 12px;
-    box-shadow: 0 6px 18px rgba(2, 6, 23, .06);
-  }
-  .meta{
-    display:flex;
-    justify-content:space-between;
-    gap:10px;
-    color: var(--muted);
-    font-size: 12px;
-    margin-bottom: 8px;
-  }
-  .text{
-    font-size: 14px;
-    line-height: 1.45;
-    color: var(--text);
-    white-space: pre-wrap;
-  }
-  .carousel{
-    margin-top: 10px;
-    display:flex;
-    gap:10px;
-    overflow-x:auto;
-    padding-bottom: 6px;
-    scroll-snap-type: x mandatory;
-  }
+  body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);}
+  .wrap{width:100%;margin:0 auto;padding:14px;}
+  .widget{border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;background:var(--bg);}
+  .head{padding:14px 14px 10px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between;gap:10px;}
+  .title{font-weight:800;font-size:16px;line-height:1.2;}
+  .subline{margin-top:6px;display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px;}
+  .online{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#f8fafc;color:#0f172a;font-size:12px;font-weight:700;white-space:nowrap;}
+  .dot{width:10px;height:10px;border-radius:999px;background:#22c55e;box-shadow:0 0 0 4px rgba(34,197,94,.15);}
+  .hint{margin:10px 14px 0;padding:10px 12px;border:1px dashed rgba(34,158,217,.35);background:rgba(34,158,217,.06);border-radius:12px;font-size:13px;}
+  .feed{height:640px;overflow:auto;padding:12px 12px 54px;background:#f8fafc;}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:12px;margin-bottom:12px;box-shadow:0 6px 18px rgba(2, 6, 23, .06);}
+  .meta{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px;margin-bottom:8px;}
+  .text{font-size:14px;line-height:1.45;white-space:pre-wrap;}
+  .text a{color:var(--tg-dark);text-decoration:none;font-weight:700;}
+  .text a:hover{text-decoration:underline;}
+  .carousel{margin-top:10px;display:flex;gap:10px;overflow-x:auto;padding-bottom:6px;scroll-snap-type:x mandatory;}
   .carousel::-webkit-scrollbar{height:8px}
-  .carousel::-webkit-scrollbar-thumb{background: rgba(15,23,42,.18); border-radius:999px}
-  .shot{
-    flex: 0 0 86%;
-    scroll-snap-align: start;
-    border-radius: 14px;
-    overflow:hidden;
-    border:1px solid var(--border);
-    background:#fff;
-  }
-  .shot img{ width:100%; display:block; }
-  .actions{
-    margin-top: 12px;
-    display:flex;
-    justify-content:flex-end;
-  }
-  .btn{
-    display:inline-flex;
-    align-items:center;
-    gap:10px;
-    padding: 10px 14px;
-    border-radius: 999px;
-    border: 1px solid rgba(34,158,217,.35);
-    background: rgba(34,158,217,.10);
-    color: var(--tg-dark);
-    font-weight: 800;
-    text-decoration:none;
-    transition: .15s ease;
-    user-select:none;
-  }
-  .btn:hover{
-    background: rgba(34,158,217,.16);
-    border-color: rgba(34,158,217,.55);
-  }
-  .plane{ width:18px;height:18px; fill: var(--tg-dark); }
-  .footer{
-    position: relative;
-    margin-top: -44px;
-    padding: 10px 14px;
-    border-top: 1px solid var(--border);
-    background: linear-gradient(to top, #ffffff 70%, rgba(255,255,255,0));
-    color: var(--muted);
-    font-size: 12px;
-    text-align:center;
-  }
-  @media (max-width:480px){
-    .feed{ height: 560px; }
-    .shot{ flex-basis: 92%; }
-  }
+  .carousel::-webkit-scrollbar-thumb{background:rgba(15,23,42,.18);border-radius:999px}
+  .shot{flex:0 0 86%;scroll-snap-align:start;border-radius:14px;overflow:hidden;border:1px solid var(--border);background:#fff;}
+  .shot img{width:100%;display:block;}
+  .actions{margin-top:12px;display:flex;justify-content:flex-end;}
+  .btn{display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:999px;border:1px solid rgba(34,158,217,.35);background:rgba(34,158,217,.10);color:var(--tg-dark);font-weight:800;text-decoration:none;transition:.15s;}
+  .btn:hover{background:rgba(34,158,217,.16);border-color:rgba(34,158,217,.55);}
+  .plane{width:18px;height:18px;fill:var(--tg-dark);}
+  .footer{position:relative;margin-top:-44px;padding:10px 14px;border-top:1px solid var(--border);background:linear-gradient(to top,#ffffff 70%,rgba(255,255,255,0));color:var(--muted);font-size:12px;text-align:center;}
+  @media (max-width:480px){.feed{height:560px}.shot{flex-basis:92%}}
 </style>
 </head>
 <body>
@@ -381,14 +221,11 @@ app.get("/widget", (req, res) => {
     </div>
 
     <div class="hint">Посты можно прокручивать <b>внутри этого блока</b>.</div>
-
     <div id="feed" class="feed"></div>
-
     <div class="footer">Прокрутите внутри блока, чтобы увидеть ещё посты ↓</div>
   </div>
 </div>
 
-<!-- VK Top.Mail.Ru counter (из env VK_TMR_ID) -->
 ${VK_TMR_ID ? `
 <script type="text/javascript">
 var _tmr = window._tmr || (window._tmr = []);
@@ -404,7 +241,6 @@ _tmr.push({id: "${VK_TMR_ID}", type: "pageView", start: (new Date()).getTime()})
 <noscript><div><img src="https://top-fwz1.mail.ru/counter?id=${VK_TMR_ID};js=na" style="position:absolute;left:-9999px;" alt="Top.Mail.Ru" /></div></noscript>
 ` : ""}
 
-<!-- Yandex Metrika loader + goal (из env YM_COUNTER_ID) -->
 ${YM_COUNTER_ID ? `
 <script type="text/javascript">
 (function(m,e,t,r,i,k,a){
@@ -420,16 +256,8 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
 <script type="module">
   const CHANNEL = ${JSON.stringify(channel)};
   const LIMIT = ${JSON.stringify(limit)};
-
-  const SUPABASE_URL = ${JSON.stringify(SUPABASE_URL)};
-  const SUPABASE_ANON_KEY = ${JSON.stringify(anon)};
-
   const feed = document.getElementById("feed");
   const subsEl = document.getElementById("subs");
-
-  function escapeHtml(s){
-    return (s || "").replace(/[&<>"']/g, (m)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m]));
-  }
 
   function fmtDate(iso){
     const dt = iso ? new Date(iso) : null;
@@ -437,13 +265,26 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
     return dt.toLocaleString("ru-RU", { year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
   }
 
+  function linkify(text){
+    // 1) экранируем
+    const esc = (s)=> (s||"").replace(/[&<>"']/g, (m)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m]));
+    let t = esc(text);
+
+    // 2) http(s)
+    t = t.replace(/(https?:\\/\\/[^\\s<]+)/g, (m)=>\`<a href="\${m}" target="_blank" rel="noopener">\${m}</a>\`);
+
+    // 3) t.me/xxx
+    t = t.replace(/(^|\\s)(t\\.me\\/[A-Za-z0-9_\\/\\-\\?=&#.%]+)/g, (all, sp, path)=>{
+      const url = "https://" + path;
+      return \`\${sp}<a href="\${url}" target="_blank" rel="noopener">\${path}</a>\`;
+    });
+
+    return t;
+  }
+
   window.trackTgOpen = function(){
-    try{
-      if (window._tmr) window._tmr.push({ type: "reachGoal", goal: "tg_open" });
-    }catch(e){}
-    try{
-      if (window.ym) ym(${YM_COUNTER_ID ? YM_COUNTER_ID : "0"}, "reachGoal", "tg_open");
-    }catch(e){}
+    try{ if (window._tmr) window._tmr.push({ type: "reachGoal", goal: "tg_open" }); }catch(e){}
+    try{ if (window.ym) ym(${YM_COUNTER_ID ? YM_COUNTER_ID : "0"}, "reachGoal", "tg_open"); }catch(e){}
   };
 
   function renderPost(item){
@@ -458,9 +299,9 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
     el.innerHTML = \`
       <div class="meta">
         <div>Пост #\${item.message_id}</div>
-        <div>\${escapeHtml(fmtDate(item.posted_at))}</div>
+        <div>\${fmtDate(item.posted_at)}</div>
       </div>
-      <div class="text">\${text ? escapeHtml(text) : "<i style='color:#64748b'>Подпись отсутствует</i>"}</div>
+      <div class="text">\${text ? linkify(text) : "<i style='color:#64748b'>Подпись отсутствует</i>"}</div>
       \${carousel}
       <div class="actions">
         <a class="btn" href="\${item.permalink}" target="_blank" rel="noopener" onclick="trackTgOpen()">
@@ -471,7 +312,6 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
         </a>
       </div>
     \`;
-
     return el;
   }
 
@@ -493,17 +333,17 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
     if (!items.length){
       const empty = document.createElement("div");
       empty.className = "card";
-      empty.innerHTML = "<div class='text' style='color:#64748b'>Пока нет данных. Загрузите историю в Supabase или дождитесь новых постов.</div>";
+      empty.innerHTML = "<div class='text' style='color:#64748b'>Пока нет данных. Запусти импорт истории с media_urls.</div>";
       feed.appendChild(empty);
       return;
     }
-    for (const it of items){
-      feed.appendChild(renderPost(it));
-    }
+    for (const it of items) feed.appendChild(renderPost(it));
   }
 
-  // Realtime: если есть anon key
+  // Realtime (опционально): если анон-ключ задан и RLS разрешает select
   async function enableRealtime(){
+    const SUPABASE_URL = ${JSON.stringify(SUPABASE_URL)};
+    const SUPABASE_ANON_KEY = ${JSON.stringify(SUPABASE_ANON_KEY)};
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
 
     const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
@@ -516,7 +356,6 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
         table: "telegram_posts",
         filter: \`channel_username=eq.\${CHANNEL}\`
       }, async () => {
-        // При любом новом элементе альбома перерисовываем список
         await loadPosts();
         await loadStats();
       })
@@ -529,10 +368,7 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
 </script>
 </body>
 </html>`;
-
   res.type("html").send(html);
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log("Server listening on " + PORT));
