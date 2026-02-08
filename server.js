@@ -14,8 +14,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHANNEL_USERNAME =
   (process.env.TELEGRAM_CHANNEL_USERNAME || "loycewear").replace("@", "").trim();
 
-const VK_TMR_ID = process.env.VK_TMR_ID || ""; // 3738381
-const YM_COUNTER_ID = process.env.YM_COUNTER_ID || ""; // 82720792
+const VK_TMR_ID = process.env.VK_TMR_ID || "";
+const YM_COUNTER_ID = process.env.YM_COUNTER_ID || "";
 
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -30,6 +30,7 @@ function getAlbumKey(row) {
 }
 
 function pickBestText(rows) {
+  // Берем первую непустую подпись в группе (как в телеге)
   for (const r of rows) {
     const t = (r.text || "").trim();
     if (t) return t;
@@ -63,7 +64,7 @@ app.get("/api/stats", async (req, res) => {
     .replace("@", "")
     .trim();
 
-  // 1) пробуем таблицу telegram_channel_stats
+  // 1) Supabase table (если у тебя настроено)
   const { data, error } = await supabaseAdmin
     .from("telegram_channel_stats")
     .select("channel_username,subscribers_count,updated_at")
@@ -83,7 +84,7 @@ app.get("/api/stats", async (req, res) => {
     }
   }
 
-  // 2) fallback: Telegram Bot API
+  // 2) Fallback: Telegram Bot API (бот должен иметь доступ к каналу)
   const cnt = await tgMemberCount(channelUsername);
   return res.json({
     channel_username: channelUsername,
@@ -93,19 +94,27 @@ app.get("/api/stats", async (req, res) => {
   });
 });
 
-// ===== posts (albums + media_urls) =====
+// ===== posts: albums + thumb/full + pagination =====
 app.get("/api/posts", async (req, res) => {
-  const limitGroups = Math.min(parseInt(req.query.limit || "20", 10), 50);
+  const limitGroups = Math.min(parseInt(req.query.limit || "10", 10), 50);
   const channelUsername = (req.query.channel || TELEGRAM_CHANNEL_USERNAME)
     .replace("@", "")
     .trim();
+  const cursor = req.query.cursor ? String(req.query.cursor) : null;
 
-  const fetchRows = Math.min(limitGroups * 20, 1000);
+  // 1 альбом = несколько строк, берем запас
+  const fetchRows = Math.min(limitGroups * 25, 1200);
 
-  const { data, error } = await supabaseAdmin
+  let q = supabaseAdmin
     .from("telegram_posts")
     .select("channel_username,message_id,posted_at,text,permalink,raw,media_urls")
-    .eq("channel_username", channelUsername)
+    .eq("channel_username", channelUsername);
+
+  if (cursor) {
+    q = q.lt("posted_at", cursor); // старее курсора
+  }
+
+  const { data, error } = await q
     .order("posted_at", { ascending: false })
     .limit(fetchRows);
 
@@ -134,15 +143,23 @@ app.get("/api/posts", async (req, res) => {
     const first = rows[0];
     const minId = first.message_id;
 
-    // собираем все фото из media_urls
+    // Собираем изображения группы: [{thumb, full}, ...]
     const images = [];
     for (const r of rows) {
       const arr = r.media_urls;
       if (Array.isArray(arr)) {
-        for (const u of arr) if (typeof u === "string" && u) images.push(u);
+        for (const x of arr) {
+          if (x && typeof x === "object") {
+            images.push({ thumb: x.thumb || null, full: x.full || null });
+          } else if (typeof x === "string") {
+            // совместимость со старым форматом
+            images.push({ thumb: x, full: x });
+          }
+        }
       }
     }
 
+    // raw нужен для entities (скрытые ссылки TextUrl)
     return {
       channel_username: channelUsername,
       message_id: minId,
@@ -150,16 +167,18 @@ app.get("/api/posts", async (req, res) => {
       text: pickBestText(rows),
       permalink: makePermalink(channelUsername, minId),
       images,
+      raw: first.raw || {},
     };
   });
 
-  res.json({ items });
+  const next_cursor = items.length ? items[items.length - 1].posted_at : null;
+  res.json({ items, next_cursor });
 });
 
-// ===== widget =====
+// ===== widget UI =====
 app.get("/widget", (req, res) => {
   const channel = (req.query.channel || TELEGRAM_CHANNEL_USERNAME).replace("@", "").trim();
-  const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
+  const limit = Math.min(parseInt(req.query.limit || "10", 10), 50);
 
   const html = `<!doctype html>
 <html lang="ru">
@@ -183,28 +202,90 @@ app.get("/widget", (req, res) => {
   .wrap{width:100%;margin:0 auto;padding:14px;}
   .widget{border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;background:var(--bg);}
   .head{padding:14px 14px 10px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between;gap:10px;}
-  .title{font-weight:800;font-size:16px;line-height:1.2;}
+  .title{font-weight:900;font-size:16px;line-height:1.2;}
   .subline{margin-top:6px;display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px;}
-  .online{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#f8fafc;color:#0f172a;font-size:12px;font-weight:700;white-space:nowrap;}
+  .online{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#f8fafc;color:#0f172a;font-size:12px;font-weight:800;white-space:nowrap;}
   .dot{width:10px;height:10px;border-radius:999px;background:#22c55e;box-shadow:0 0 0 4px rgba(34,197,94,.15);}
   .hint{margin:10px 14px 0;padding:10px 12px;border:1px dashed rgba(34,158,217,.35);background:rgba(34,158,217,.06);border-radius:12px;font-size:13px;}
-  .feed{height:640px;overflow:auto;padding:12px 12px 54px;background:#f8fafc;}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:12px;margin-bottom:12px;box-shadow:0 6px 18px rgba(2, 6, 23, .06);}
+  .feed{height:640px;overflow:auto;padding:12px 12px 12px;background:#f8fafc;}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:12px;margin-bottom:12px;box-shadow:0 6px 18px rgba(2,6,23,.06);}
   .meta{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px;margin-bottom:8px;}
   .text{font-size:14px;line-height:1.45;white-space:pre-wrap;}
-  .text a{color:var(--tg-dark);text-decoration:none;font-weight:700;}
+  .text a{color:var(--tg-dark);text-decoration:none;font-weight:800;}
   .text a:hover{text-decoration:underline;}
-  .carousel{margin-top:10px;display:flex;gap:10px;overflow-x:auto;padding-bottom:6px;scroll-snap-type:x mandatory;}
-  .carousel::-webkit-scrollbar{height:8px}
-  .carousel::-webkit-scrollbar-thumb{background:rgba(15,23,42,.18);border-radius:999px}
-  .shot{flex:0 0 86%;scroll-snap-align:start;border-radius:14px;overflow:hidden;border:1px solid var(--border);background:#fff;}
-  .shot img{width:100%;display:block;}
+
+  /* Telegram-like grid */
+  .grid{ margin-top:10px; display:grid; gap:8px; }
+  .grid.cols-1{ grid-template-columns:1fr; }
+  .grid.cols-2{ grid-template-columns:1fr 1fr; }
+  .grid.cols-3{ grid-template-columns:1fr 1fr 1fr; }
+  .grid .cell{
+    border-radius:14px;
+    overflow:hidden;
+    border:1px solid var(--border);
+    background:#fff;
+    aspect-ratio:1/1;
+  }
+  .grid .cell img{
+    width:100%; height:100%;
+    object-fit:cover;
+    display:block;
+    cursor:pointer;
+  }
+  @media (max-width:480px){
+    .feed{height:560px}
+    .grid.cols-3{ grid-template-columns:1fr 1fr; }
+  }
+
   .actions{margin-top:12px;display:flex;justify-content:flex-end;}
-  .btn{display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:999px;border:1px solid rgba(34,158,217,.35);background:rgba(34,158,217,.10);color:var(--tg-dark);font-weight:800;text-decoration:none;transition:.15s;}
+  .btn{display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:999px;border:1px solid rgba(34,158,217,.35);background:rgba(34,158,217,.10);color:var(--tg-dark);font-weight:900;text-decoration:none;transition:.15s;}
   .btn:hover{background:rgba(34,158,217,.16);border-color:rgba(34,158,217,.55);}
   .plane{width:18px;height:18px;fill:var(--tg-dark);}
-  .footer{position:relative;margin-top:-44px;padding:10px 14px;border-top:1px solid var(--border);background:linear-gradient(to top,#ffffff 70%,rgba(255,255,255,0));color:var(--muted);font-size:12px;text-align:center;}
-  @media (max-width:480px){.feed{height:560px}.shot{flex-basis:92%}}
+
+  .moreWrap{padding: 0 12px 14px; background:#f8fafc;}
+  .moreBtn{
+    width:100%;
+    padding:12px 14px;
+    border-radius:14px;
+    border:1px solid rgba(34,158,217,.35);
+    background: rgba(34,158,217,.10);
+    color:#1C8ABF;
+    font-weight:900;
+    cursor:pointer;
+  }
+
+  .footer{padding:10px 14px;border-top:1px solid var(--border);background:#fff;color:var(--muted);font-size:12px;text-align:center;}
+
+  /* Lightbox */
+  .lb{
+    position:fixed; inset:0;
+    background: rgba(15,23,42,.72);
+    display:none;
+    align-items:center;
+    justify-content:center;
+    padding: 18px;
+    z-index: 9999;
+  }
+  .lb.show{display:flex;}
+  .lb img{
+    max-width: min(920px, 96vw);
+    max-height: 92vh;
+    border-radius: 16px;
+    border: 1px solid rgba(255,255,255,.25);
+    box-shadow: 0 20px 70px rgba(0,0,0,.45);
+    background:#fff;
+  }
+  .lbClose{
+    position:fixed;
+    top:14px; right:14px;
+    width:44px; height:44px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.25);
+    background: rgba(255,255,255,.12);
+    color:#fff;
+    font-weight:900;
+    cursor:pointer;
+  }
 </style>
 </head>
 <body>
@@ -221,9 +302,20 @@ app.get("/widget", (req, res) => {
     </div>
 
     <div class="hint">Посты можно прокручивать <b>внутри этого блока</b>.</div>
+
     <div id="feed" class="feed"></div>
+
+    <div class="moreWrap">
+      <button id="moreBtn" class="moreBtn">Показать ещё</button>
+    </div>
+
     <div class="footer">Прокрутите внутри блока, чтобы увидеть ещё посты ↓</div>
   </div>
+</div>
+
+<div id="lb" class="lb" role="dialog" aria-modal="true">
+  <button id="lbClose" class="lbClose">✕</button>
+  <img id="lbImg" alt=""/>
 </div>
 
 ${VK_TMR_ID ? `
@@ -256,8 +348,16 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
 <script type="module">
   const CHANNEL = ${JSON.stringify(channel)};
   const LIMIT = ${JSON.stringify(limit)};
+
   const feed = document.getElementById("feed");
   const subsEl = document.getElementById("subs");
+  const moreBtn = document.getElementById("moreBtn");
+
+  const lb = document.getElementById("lb");
+  const lbImg = document.getElementById("lbImg");
+  const lbClose = document.getElementById("lbClose");
+
+  let cursor = null;
 
   function fmtDate(iso){
     const dt = iso ? new Date(iso) : null;
@@ -265,110 +365,15 @@ ym(${YM_COUNTER_ID}, "init", { clickmap:true, trackLinks:true, accurateTrackBoun
     return dt.toLocaleString("ru-RU", { year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
   }
 
-  function linkify(text){
-    // 1) экранируем
-    const esc = (s)=> (s||"").replace(/[&<>"']/g, (m)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m]));
-    let t = esc(text);
-
-    // 2) http(s)
-    t = t.replace(/(https?:\\/\\/[^\\s<]+)/g, (m)=>\`<a href="\${m}" target="_blank" rel="noopener">\${m}</a>\`);
-
-    // 3) t.me/xxx
-    t = t.replace(/(^|\\s)(t\\.me\\/[A-Za-z0-9_\\/\\-\\?=&#.%]+)/g, (all, sp, path)=>{
-      const url = "https://" + path;
-      return \`\${sp}<a href="\${url}" target="_blank" rel="noopener">\${path}</a>\`;
-    });
-
-    return t;
+  function escapeHtml(s){
+    return (s || "").replace(/[&<>"']/g, (m)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m]));
   }
 
-  window.trackTgOpen = function(){
-    try{ if (window._tmr) window._tmr.push({ type: "reachGoal", goal: "tg_open" }); }catch(e){}
-    try{ if (window.ym) ym(${YM_COUNTER_ID ? YM_COUNTER_ID : "0"}, "reachGoal", "tg_open"); }catch(e){}
-  };
-
-  function renderPost(item){
-    const el = document.createElement("div");
-    el.className = "card";
-
-    const text = (item.text || "").trim();
-    const carousel = Array.isArray(item.images) && item.images.length
-      ? \`<div class="carousel">\${item.images.map(u => \`<div class="shot"><img src="\${u}" loading="lazy" /></div>\`).join("")}</div>\`
-      : "";
-
-    el.innerHTML = \`
-      <div class="meta">
-        <div>Пост #\${item.message_id}</div>
-        <div>\${fmtDate(item.posted_at)}</div>
-      </div>
-      <div class="text">\${text ? linkify(text) : "<i style='color:#64748b'>Подпись отсутствует</i>"}</div>
-      \${carousel}
-      <div class="actions">
-        <a class="btn" href="\${item.permalink}" target="_blank" rel="noopener" onclick="trackTgOpen()">
-          <svg class="plane" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M21.9 4.6c.3-1.3-1-2.2-2.1-1.7L2.6 10c-1.4.6-1.3 2.6.1 3.1l4.7 1.6 1.8 5.2c.5 1.4 2.4 1.5 3.1.2l2.7-4.7 4.7 3.4c1.2.9 2.9.2 3.2-1.3L21.9 4.6zM9.4 14.1l8.7-7.1-7 8.5-.3 3-1.5-4.1-3.9-1.3 13.7-5.6-9.7 6.6z"/>
-          </svg>
-          Открыть пост в канале!
-        </a>
-      </div>
-    \`;
-    return el;
-  }
-
-  async function loadStats(){
-    const r = await fetch(\`/api/stats?channel=\${encodeURIComponent(CHANNEL)}\`);
-    const j = await r.json().catch(()=>null);
-    if (j && typeof j.subscribers_count === "number") {
-      subsEl.textContent = "Подписчиков: " + j.subscribers_count.toLocaleString("ru-RU");
-    } else {
-      subsEl.textContent = "Подписчиков: —";
-    }
-  }
-
-  async function loadPosts(){
-    feed.innerHTML = "";
-    const r = await fetch(\`/api/posts?channel=\${encodeURIComponent(CHANNEL)}&limit=\${LIMIT}\`);
-    const j = await r.json().catch(()=>null);
-    const items = j?.items || [];
-    if (!items.length){
-      const empty = document.createElement("div");
-      empty.className = "card";
-      empty.innerHTML = "<div class='text' style='color:#64748b'>Пока нет данных. Запусти импорт истории с media_urls.</div>";
-      feed.appendChild(empty);
-      return;
-    }
-    for (const it of items) feed.appendChild(renderPost(it));
-  }
-
-  // Realtime (опционально): если анон-ключ задан и RLS разрешает select
-  async function enableRealtime(){
-    const SUPABASE_URL = ${JSON.stringify(SUPABASE_URL)};
-    const SUPABASE_ANON_KEY = ${JSON.stringify(SUPABASE_ANON_KEY)};
-    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
-
-    const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
-    const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-
-    sb.channel("tg-posts")
-      .on("postgres_changes", {
-        event: "INSERT",
-        schema: "public",
-        table: "telegram_posts",
-        filter: \`channel_username=eq.\${CHANNEL}\`
-      }, async () => {
-        await loadPosts();
-        await loadStats();
-      })
-      .subscribe();
-  }
-
-  await loadStats();
-  await loadPosts();
-  await enableRealtime();
-</script>
-</body>
-</html>`;
-  res.type("html").send(html);
-});
-
-app.listen(PORT, () => console.log("Server listening on " + PORT));
+  // Делает кликабельными обычные ссылки + скрытые TextUrl (entities)
+  function renderTelegramText(text, raw){
+    const t = text || "";
+    const entities = raw?.entities || raw?.caption_entities || [];
+    if (!Array.isArray(entities) || !entities.length) {
+      // fallback: http(s)
+      return escapeHtml(t).replace(/(https?:\\/\\/[^\\s<]+)/g, (m)=>\`<a href="\${m}" target="_blank" rel="noopener">\${m}</a>\`)
+                         .replace(/(^|\\s)(t\\.me\\/[A-Za-z0-9_\\/\\-\\?=&#.%]+)/g, (all, sp, path)=>{
